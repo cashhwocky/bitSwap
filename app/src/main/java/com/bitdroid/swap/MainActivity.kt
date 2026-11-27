@@ -98,6 +98,7 @@ fun App() {
             item { StatusCard() }
             item { RomCard(onPick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) }) }
             item { StepsCard() }
+            item { AdvancedCard() }
             item {
                 val ready = s.root == RootClient.Root.OK && s.summary != null && s.profile != null && !s.busy && !s.finished
                 Button(
@@ -287,6 +288,65 @@ private fun StepsCard() {
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+}
+
+@Composable
+private fun AdvancedCard() {
+    val s = Swapper
+    var open by remember { mutableStateOf(false) }
+    var warn by remember { mutableStateOf(false) }
+    Card(shape = CardShape, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+        Column(Modifier.padding(20.dp).animateContentSize()) {
+            Row(Modifier.fillMaxWidth().clickable { open = !open }, verticalAlignment = Alignment.CenterVertically) {
+                Text("Advanced", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                if (s.ignoreFirmware) Text("⚠ on", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(8.dp))
+                Text(if (open) "Hide" else "Show")
+            }
+            if (open) {
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Ignore firmware differences", fontWeight = FontWeight.Medium)
+                        Text(
+                            "Switch even if the bootloader, modem or other firmware on the other slot isn't the same as yours. " +
+                                "bitSwap still never writes firmware, and still refuses ROMs older than Android 17. Turns itself off when you close bitSwap.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Switch(
+                        checked = s.ignoreFirmware,
+                        enabled = !s.busy,
+                        onCheckedChange = { on -> if (on) warn = true else s.ignoreFirmware = false }
+                    )
+                }
+            }
+        }
+    }
+    if (warn) {
+        AlertDialog(
+            onDismissRequest = { warn = false },
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            title = { Text("Ignore firmware differences?", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Black) },
+            text = {
+                Text(
+                    "The other slot will boot with whatever bootloader and firmware it has now, not yours. " +
+                        "If that firmware is older than what this Pixel has already run, anti-rollback can refuse to boot it, and that can hard-brick the phone " +
+                        "(no fastboot, no fix without Google). Only turn this on if you know the other slot's firmware isn't older.",
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { warn = false; s.ignoreFirmware = true; s.log("⚠ Ignore firmware differences: ON") },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, contentColor = MaterialTheme.colorScheme.onError),
+                    shape = RoundedCornerShape(50)
+                ) { Text("I understand, turn it on") }
+            },
+            dismissButton = { TextButton(onClick = { warn = false }) { Text("Cancel") } }
+        )
     }
 }
 

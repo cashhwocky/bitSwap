@@ -62,6 +62,8 @@ object Swapper {
     var progressDetail by mutableStateOf(""); private set
     var error by mutableStateOf<String?>(null)
     var finished by mutableStateOf(false); private set
+    /** Advanced: keep going even if firmware differs between slots. Off every time the app starts. */
+    var ignoreFirmware by mutableStateOf(false)
     val logLines = mutableStateListOf<String>()
 
     val steps = listOf(
@@ -263,11 +265,14 @@ object Swapper {
                     val fw = client.cmd("FWCHECK " + s.plain.joinToString(" ") { it.name })
                     val checked = fw.substringAfter("checked=").substringBefore(" ").split(',').filter { it.isNotBlank() }
                     val diff = fw.substringAfter("diff=").split(',').filter { it.isNotBlank() }
-                    if (diff.isNotEmpty()) {
+                    if (diff.isNotEmpty() && ignoreFirmware) {
+                        log("⚠ Firmware differs between slots (${diff.joinToString(", ")}). Continuing because \"Ignore firmware differences\" is on.")
+                        step(3, StepState.DONE, "⚠ Different on the other slot: ${diff.joinToString(", ")}. Ignored (your setting).")
+                    } else if (diff.isNotEmpty()) {
                         throw SecurityException("The other slot has different firmware than the slot you're running (${diff.joinToString(", ")}). " +
                             "Booting it could run older firmware, the anti-rollback brick. bitSwap never writes firmware, so it stopped. Nothing was changed.")
                     }
-                    step(3, StepState.DONE, "Both slots have the same firmware (${checked.size} partitions) ✓")
+                    else step(3, StepState.DONE, "Both slots have the same firmware (${checked.size} partitions) ✓")
 
                     // 4. super
                     cur = 4; step(4, StepState.RUNNING, "Reading super's partition table…")
