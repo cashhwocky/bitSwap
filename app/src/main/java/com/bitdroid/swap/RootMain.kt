@@ -180,22 +180,27 @@ object RootMain {
         val pk = File(OTA_DIR, "pk.pem")
         pk.writeBytes(pem)
         sh("chmod 644 ${pk.absolutePath}")
-        val targets = listOf(
-            "/system/etc/update_engine/update_payload_key.pub.pem",
-            "/system/etc/update_engine/update-payload-key.pub.pem",
-            "/etc/update_engine/update_payload_key.pub.pem",
-            "/etc/update_engine/update-payload-key.pub.pem",
-        ).map { File(it) }.filter { it.exists() }.distinctBy { runCatching { it.canonicalPath }.getOrDefault(it.path) }
-        if (targets.isEmpty()) { reply("@@OK no-key-path (updater may use a built-in key)"); return }
+        // Find the public key(s) update_engine verifies the payload with. Names and locations vary by
+        // ROM, so look in the known dirs AND search the read-only partitions for anything key-shaped.
+        val found = LinkedHashSet<String>()
+        for (d in listOf("/system/etc/update_engine", "/system_ext/etc/update_engine", "/vendor/etc/update_engine",
+                         "/product/etc/update_engine", "/etc/update_engine", "/system/etc/security")) {
+            sh("ls -1 $d 2>/dev/null").out.lines().forEach { n -> if (n.trim().endsWith(".pem")) found.add("$d/${n.trim()}") }
+        }
+        sh("find /system /system_ext /vendor /product -type f \\( -iname '*payload*key*.pem' -o -iname 'update?payload?key*.pem' \\) 2>/dev/null")
+            .out.lines().forEach { if (it.trim().isNotBlank()) found.add(it.trim()) }
+        val targets = found.map { File(it) }.filter { it.exists() }.distinctBy { runCatching { it.canonicalPath }.getOrDefault(it.path) }
+        if (targets.isEmpty()) { reply("@@OK NO-KEY-FILE: update_engine's key isn't a file on this ROM; its signature can't be overridden"); return }
         var done = 0
+        val names = mutableListOf<String>()
         for (t in targets) {
             sh("chcon --reference=${t.absolutePath} ${pk.absolutePath} 2>/dev/null")
-            // try init's namespace first (so the daemon sees it), then a plain bind
+            // init's mount namespace, so the update_engine daemon (child of init) actually sees the swap
             val ns = sh("nsenter -t 1 -m -- mount -o bind ${pk.absolutePath} ${t.absolutePath} 2>&1")
             val ok = ns.code == 0 || sh("mount -o bind ${pk.absolutePath} ${t.absolutePath} 2>&1").code == 0
-            if (ok) done++ else log("couldn't swap the key at ${t.absolutePath}: ${ns.out}")
+            if (ok) { done++; names.add(t.absolutePath) } else log("couldn't swap the key at ${t.absolutePath}: ${ns.out}")
         }
-        reply("@@OK $done/${targets.size} key path(s) swapped")
+        reply("@@OK swapped $done/${targets.size}: ${names.joinToString(", ")}")
     }
 
     // ---------------- run update_engine ----------------
@@ -204,36 +209,49 @@ object RootMain {
         if (!File(OTA_FILE).exists()) throw IOException("payload isn't staged")
         if (File(OTA_FILE).length() != size) throw IOException("staged payload is the wrong size")
         val headers = String(Base64.getDecoder().decode(headersB64), Charsets.UTF_8)
-        sh("$UE --reset_status 2>&1") // clear any previous (failed/applied) update
-        val cmd = listOf(
-            "/system/bin/sh", "-c",
-            "$UE --follow --payload=file://$OTA_FILE --offset=0 --size=$size --headers=${shellQuote(headers)} 2>&1"
-        )
-        val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
-        p.outputStream.close()
-        p.inputStream.bufferedReader().forEachLine { line ->
-            parseProgress(line)?.let { prog(it) }
-            if (line.isNotBlank()) reply("@@L ue: ${line.trim()}")
+        sh("$UE --reset_status 2>&1")           // clear any previous (failed/applied) update
+        sh("logcat -b all -c 2>/dev/null")      // so we can read the fresh reason if it rejects
+        // kick off the install (no --follow: it would hang forever if the daemon rejects and goes idle)
+        val kick = sh("$UE --payload=file://$OTA_FILE --offset=0 --size=$size --headers=${shellQuote(headers)} 2>&1")
+        // poll the daemon for progress + terminal state
+        val start = System.currentTimeMillis()
+        var started = false
+        while (true) {
+            val st = sh("$UE --status 2>&1").out
+            val op = Regex("CURRENT_OP=([A-Z_]+)").find(st)?.groupValues?.get(1) ?: "UNKNOWN"
+            Regex("PROGRESS=([0-9.]+)").find(st)?.let { it.groupValues[1].toFloatOrNull()?.let { v -> prog(v) } }
+            when (op) {
+                "UPDATED_NEED_REBOOT" -> { prog(1f); reply("@@OK"); return }
+                "REPORTING_ERROR_EVENT" -> throw IOException(explainFail(kick))
+                "DOWNLOADING", "VERIFYING", "FINALIZING", "CLEANUP_PREVIOUS_UPDATE" -> { started = true }
+                "IDLE" -> {
+                    // idle after we kicked it off = it rejected the payload and never ran
+                    if (started || kick.code != 0 || System.currentTimeMillis() - start > 20_000) throw IOException(explainFail(kick))
+                }
+            }
+            if (System.currentTimeMillis() - start > 2L * 60 * 60 * 1000) throw IOException("Android's updater timed out after 2 hours.")
+            Thread.sleep(1500)
         }
-        val code = p.waitFor()
-        val status = ueStatus()
-        if (status != "UPDATED_NEED_REBOOT") {
-            val extra = if (status.contains("ERROR") || code != 0)
-                " This usually means update_engine rejected the ROM, most often because it's signed with different keys than the ROM you're running. If so, install it with bitFlash from your other phone instead."
-            else ""
-            throw IOException("Android's updater didn't finish (status: $status, exit $code).$extra")
-        }
-        prog(1f)
-        reply("@@OK")
     }
 
-    private fun parseProgress(line: String): Float? {
-        Regex("[Pp]rogress[^0-9]*([0-9]+(?:\\.[0-9]+)?)").find(line)?.let {
-            val v = it.groupValues[1].toFloat()
-            return if (v > 1f) (v / 100f).coerceIn(0f, 1f) else v
+    /** Builds a plain-words reason from the kick-off output + update_engine's own logcat. */
+    private fun explainFail(kick: ShResult): String {
+        val logs = sh("logcat -b all -d -s update_engine:* update_engine_client:* DeltaPerformer:* 2>/dev/null").out
+        val lines = (kick.out + "\n" + logs).lines()
+            .filter { it.contains("rror", true) || it.contains("verif", true) || it.contains("signature", true) ||
+                      it.contains("timestamp", true) || it.contains("key", true) || it.contains("fail", true) }
+            .map { it.trim() }.distinct().takeLast(6)
+        val detail = lines.joinToString(" | ").ifBlank { kick.out.lines().lastOrNull { it.isNotBlank() } ?: "no details" }
+        val hint = when {
+            detail.contains("signature", true) || detail.contains("verif", true) || detail.contains("key", true) ->
+                " → This ROM is signed with a key update_engine won't trust, and its key couldn't be overridden on this ROM. Install it with bitFlash instead."
+            detail.contains("timestamp", true) || detail.contains("downgrade", true) ->
+                " → This ROM's build is older than what's installed (anti-rollback). Use a newer build, or bitFlash."
+            detail.contains("space", true) || detail.contains("ENOSPC", true) ->
+                " → Not enough space to install. Free up storage and try again."
+            else -> " → Install it with bitFlash from your other phone instead."
         }
-        Regex("([0-9]+(?:\\.[0-9]+)?)%").find(line)?.let { return (it.groupValues[1].toFloat() / 100f).coerceIn(0f, 1f) }
-        return null
+        return "Android's updater rejected the ROM. $detail$hint"
     }
 
     private fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
