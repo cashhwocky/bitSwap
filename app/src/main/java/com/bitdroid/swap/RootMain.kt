@@ -24,7 +24,7 @@ import java.util.Base64
  *  - the slot to write is worked out here from ro.boot.slot_suffix; the running slot is never written
  *  - only OS partitions (Safety.OS_PLAIN) and the ROM's partitions inside super can be written
  *  - writes into super only land in space that no running-slot partition uses
- *  - bootloader, modem, firmware and lock state are never touched; misc only gets the wipe message
+ *  - bootloader, modem, firmware and lock state are never touched (pvmfw comes from the ROM, like recovery); misc only gets the wipe message
  */
 object RootMain {
 
@@ -70,7 +70,7 @@ object RootMain {
                     "PLAN" -> planCmd(readBlob(input, a[1].toInt()))
                     "PLAINSIZE" -> reply("@@OK ${plainSize(a[1])}")
                     "UNBOOTABLE" -> markOtherUnbootable()
-                    "FWCHECK" -> fwCheck()
+                    "FWCHECK" -> fwCheck(a.drop(1).toSet())
                     "WRITE" -> { val len = a[3].toInt(); val data = readBlob(input, len); write(a[1], a[2].toLong(), data, len); reply("@@OK") }
                     "ZERO" -> { zero(a[1], a[2].toLong(), a[3].toLong()); reply("@@OK") }
                     "VERITY" -> verity(a)
@@ -345,14 +345,16 @@ object RootMain {
     // ---------------- firmware check (read only) ----------------
 
     /**
-     * Compares every A/B partition that isn't an OS partition (bootloader, modem, firmware…) between
+     * Compares every A/B partition that the ROM doesn't rewrite (bootloader, modem, firmware…) between
      * the two slots. If they differ, booting the other slot could run older firmware: refuse.
      * Read only: nothing is written.
      */
-    private fun fwCheck() {
+    private fun fwCheck(fromRom: Set<String>) {
         val names = (File(BY_NAME).list() ?: emptyArray()).toSet()
         val fw = names.filter { it.endsWith("_a") }.map { it.removeSuffix("_a") }
-            .filter { "${it}_b" in names && it !in Safety.OS_PLAIN }
+            .filter { "${it}_b" in names && it !in Safety.SLOT_DATA }
+            // OS partitions are rewritten from the ROM; pvmfw only counts as handled if this ROM has one
+            .filter { it !in Safety.OS_PLAIN || (it == "pvmfw" && it !in fromRom) }
             .sorted()
         val total = fw.sumOf { runCatching { devSize(open("$BY_NAME/${it}_a", false)) }.getOrDefault(0L) }.coerceAtLeast(1)
         var done = 0L

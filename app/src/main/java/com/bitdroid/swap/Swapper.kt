@@ -260,7 +260,7 @@ object Swapper {
                     // 3. firmware
                     cur = 3; step(3, StepState.RUNNING, "Comparing bootloader, modem and firmware on both slots (read only)…")
                     client.onProgress = { p -> setProgress(p * 0.02f, "Comparing firmware") }
-                    val fw = client.cmd("FWCHECK")
+                    val fw = client.cmd("FWCHECK " + s.plain.joinToString(" ") { it.name })
                     val checked = fw.substringAfter("checked=").substringBefore(" ").split(',').filter { it.isNotBlank() }
                     val diff = fw.substringAfter("diff=").split(',').filter { it.isNotBlank() }
                     if (diff.isNotEmpty()) {

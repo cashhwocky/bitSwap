@@ -29,16 +29,24 @@ object Safety {
 
     /**
      * The only partitions outside `super` that bitSwap will ever write (on the other slot only).
-     * Everything else in a ROM zip (bootloader, modem, firmware, pvmfw…) is skipped.
+     * Everything else in a ROM zip (bootloader, modem, other firmware) is skipped.
      */
     val OS_PLAIN: Set<String> = setOf(
         "boot", "init_boot", "vendor_boot", "vendor_kernel_boot", "dtbo",
         "vbmeta", "vbmeta_system", "vbmeta_vendor",
+        // protected-VM firmware: not part of the boot chain; written from the ROM like recovery does
+        "pvmfw",
     )
+
+    /**
+     * Per-slot data the bootloader writes itself (RAM calibration), so it's expected to differ
+     * between slots. Never written by bitSwap, just not counted in the firmware comparison.
+     */
+    val SLOT_DATA: Set<String> = setOf("dram_train")
 
     /** Never written, never wiped, whatever a zip says. Listed so the log can say why. */
     val NEVER: Set<String> = setOf(
-        "abl", "bl1", "bl2", "bl31", "pbl", "gsa", "gsa_bl1", "ldfw", "tzsw", "gcf", "pvmfw",
+        "abl", "bl1", "bl2", "bl31", "pbl", "gsa", "gsa_bl1", "ldfw", "tzsw", "gcf", "dram_train",
         "modem", "radio", "bootloader", "xbl", "xbl_config", "aop", "tz", "hyp", "keymaster",
         "misc", "devinfo", "frp", "persist", "efs", "efs_backup", "metadata", "userdata", "super",
         "fips", "dpm", "ufs", "ufsfw",
