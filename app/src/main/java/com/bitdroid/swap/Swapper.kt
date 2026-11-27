@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.nio.channels.FileChannel
@@ -64,6 +65,13 @@ object Swapper {
     var finished by mutableStateOf(false); private set
     /** Advanced: keep going even if firmware differs between slots. Off every time the app starts. */
     var ignoreFirmware by mutableStateOf(false)
+    /** Patch the new ROM's boot image with Magisk so it boots rooted. On by default. */
+    var rootNewRom by mutableStateOf(true)
+    val magiskReady: Boolean get() = ::ctx.isInitialized && Magisk.available(ctx)
+    val magiskVersion: String get() = if (::ctx.isInitialized) Magisk.version(ctx) else "?"
+    /** init_boot on the 10s, boot on the 6a (whichever holds the ramdisk Magisk patches). */
+    private fun patchTarget(plain: List<Payload.Part>): String =
+        if (plain.any { it.name == "init_boot" }) "init_boot" else "boot"
     val logLines = mutableStateListOf<String>()
 
     val steps = listOf(
@@ -290,6 +298,10 @@ object Swapper {
                     step(5, StepState.DONE, "Slot $target marked not ready. Your running slot is untouched.")
 
                     // 6 + 7. write
+                    val patchName = patchTarget(s.plain)
+                    val doRoot = rootNewRom && Magisk.available(ctx)
+                    if (rootNewRom && !doRoot) log("⚠ This bitSwap build has no Magisk bundled, so the new ROM will be installed unrooted.")
+                    if (doRoot) log("Will root the new ROM: $patchName gets patched with Magisk ${Magisk.version(ctx)} before it's written.")
                     val total = s.totalBytes.toDouble().coerceAtLeast(1.0)
                     var doneBytes = 0L
                     fun writeAll(stepIdx: Int, parts: List<Payload.Part>) {
@@ -298,12 +310,19 @@ object Swapper {
                             val base = 0.03 + 0.95 * doneBytes / total
                             val span = 0.95 * p.size / total
                             main.post { steps[stepIdx].detail = "${p.name} (${i + 1}/${parts.size})…" }
-                            writePart(client, ch, s.manifest, p) { frac, what ->
-                                setProgress((base + span * frac).toFloat(), "${p.name}: $what")
+                            if (doRoot && p.name == patchName) {
+                                writeRooted(client, ch, s.manifest, p) { frac, what ->
+                                    setProgress((base + span * frac).toFloat(), "${p.name}: $what")
+                                }
+                            } else {
+                                writePart(client, ch, s.manifest, p) { frac, what ->
+                                    setProgress((base + span * frac).toFloat(), "${p.name}: $what")
+                                }
                             }
                             doneBytes += p.size
                         }
-                        step(stepIdx, StepState.DONE, parts.joinToString(" ") { it.name } + " ✓ (all verified)")
+                        val extra = if (stepIdx == 6 && doRoot) " ($patchName rooted)" else ""
+                        step(stepIdx, StepState.DONE, parts.joinToString(" ") { it.name } + " ✓ (all verified)$extra")
                     }
                     writeAll(6, s.plain)
                     writeAll(7, s.dynamic)
@@ -350,6 +369,87 @@ object Swapper {
                 main.post { busy = false; busyLabel = ""; progressDetail = ""; if (!finished) progress = null }
             }
         }.start()
+    }
+
+    /**
+     * Writes a boot image (init_boot / boot) to the other slot after patching it with Magisk,
+     * so the new ROM comes up rooted. The extracted image is checked against the ROM's hash first;
+     * the written partition is checked against the patched image's hash (it won't match the ROM's,
+     * because Magisk changed it). Boot images have no dm-verity hash tree / FEC, so none is built.
+     */
+    private fun writeRooted(rc: RootClient, ch: FileChannel, m: Payload.Manifest, p: Payload.Part, prog: (Double, String) -> Unit) {
+        if (p.hasVerity || p.hasFec) throw IOException("${p.name} has a hash tree; bitSwap won't Magisk-patch that.")
+        rc.onProgress = {}
+        prog(0.0, "reading ${p.name} from the ROM")
+        val stock = File(ctx.cacheDir, "stock_${p.name}.img")
+        try {
+            extractImage(ch, m, p) { f -> prog(0.35 * f, "reading ${p.name} from the ROM") }
+            // the extracted image must match the ROM before we touch it
+            val got = sha256File(stock)
+            if (!got.contentEquals(p.hash)) throw IOException("${p.name} came out of the zip wrong (checksum mismatch). Stopped, nothing switched.")
+            prog(0.4, "patching with Magisk")
+            log("Patching ${p.name} with Magisk ${Magisk.version(ctx)} so the new ROM boots rooted…")
+            val patched = Magisk.patch(ctx, stock, ::log)
+            val psize = rc.cmd("PLAINSIZE ${p.name}").toLong()
+            if (patched.length() > psize) throw IOException("The patched ${p.name} (${patched.length()}) is bigger than the phone's ${p.name} partition ($psize).")
+            // write the patched image, then zero the rest of the partition
+            prog(0.6, "writing rooted ${p.name}")
+            val buf = ByteArray(8 shl 20)
+            patched.inputStream().use { ins ->
+                var pos = 0L
+                while (true) {
+                    val n = ins.read(buf); if (n <= 0) break
+                    rc.write(p.name, pos, buf, 0, n); pos += n
+                    prog(0.6 + 0.25 * pos / patched.length(), "writing rooted ${p.name}")
+                }
+            }
+            if (patched.length() < psize) rc.cmd("ZERO ${p.name} ${patched.length()} ${psize - patched.length()}")
+            // verify what landed on the partition == the patched image
+            prog(0.9, "verifying")
+            rc.onProgress = { f -> prog(0.9 + 0.1 * f, "verifying") }
+            val onDisk = rc.cmd("HASH ${p.name} ${patched.length()}")
+            val want = sha256File(patched).joinToString("") { "%02x".format(it) }
+            if (!onDisk.equals(want, ignoreCase = true)) throw IOException("The rooted ${p.name} didn't verify after writing. Stopped before switching; your running ROM is untouched.")
+            rc.onProgress = {}
+            log("   ${p.name}: patched, written and verified ✓ (new ROM will be rooted)")
+        } finally {
+            runCatching { stock.delete() }
+            runCatching { File(ctx.filesDir, "magisk-work").deleteRecursively() }
+        }
+    }
+
+    /** Writes partition [p]'s full image (data ops only — boot images have no verity) to a local file. */
+    private fun extractImage(ch: FileChannel, m: Payload.Manifest, p: Payload.Part, prog: (Double) -> Unit) {
+        val bs = m.blockSize
+        val out = File(ctx.cacheDir, "stock_${p.name}.img")
+        java.io.RandomAccessFile(out, "rw").use { raf ->
+            raf.setLength(0); if (p.size > 0) raf.setLength(p.size)
+            for ((i, op) in p.ops.withIndex()) {
+                val dstBytes = op.dst.sumOf { it.count } * bs
+                for (e in op.dst) if (e.end * bs > p.size) throw IOException("${p.name}: data past the end. Bad ROM zip?")
+                when (op.type) {
+                    Payload.ZERO, Payload.DISCARD -> {}
+                    else -> {
+                        val at = m.dataStart + op.offset
+                        if (op.length <= 0 || op.length > 256L * 1024 * 1024 || at + op.length > m.payloadEnd) throw IOException("${p.name}: data block out of range.")
+                        val data = OpData.decode(op, Safety.readBytes(ch, at, op.length.toInt()), dstBytes.toInt())
+                        var off = 0
+                        for (e in op.dst) {
+                            val n = (e.count * bs).toInt()
+                            raf.seek(e.start * bs); raf.write(data, off, n); off += n
+                        }
+                    }
+                }
+                prog((i + 1.0) / p.ops.size)
+            }
+        }
+    }
+
+    private fun sha256File(f: File): ByteArray {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val b = ByteArray(1 shl 20)
+        f.inputStream().use { while (true) { val n = it.read(b); if (n <= 0) break; md.update(b, 0, n) } }
+        return md.digest()
     }
 
     /** Writes one partition to the other slot, builds verity if needed, then checks its hash. */

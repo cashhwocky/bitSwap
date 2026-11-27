@@ -97,6 +97,7 @@ fun App() {
             }
             item { StatusCard() }
             item { RomCard(onPick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) }) }
+            item { RootNewRomCard() }
             item { StepsCard() }
             item { AdvancedCard() }
             item {
@@ -287,6 +288,29 @@ private fun StepsCard() {
                 "Everything before \"Save the new partition table\" only touches the other slot. If anything fails, bitSwap stops and your phone boots the ROM you're on now.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+    }
+}
+
+@Composable
+private fun RootNewRomCard() {
+    val s = Swapper
+    val ready = s.magiskReady
+    Card(shape = CardShape, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+        Row(Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Root the new ROM", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (ready)
+                        "bitSwap patches the new ROM's boot image with Magisk ${s.magiskVersion} before writing it, so you switch straight into a rooted ROM. Root once, stay rooted across switches."
+                    else
+                        "This bitSwap build has no Magisk bundled, so the new ROM will be installed unrooted. Update bitSwap to get this.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(checked = s.rootNewRom && ready, enabled = ready && !s.busy, onCheckedChange = { s.rootNewRom = it })
         }
     }
 }
