@@ -75,18 +75,14 @@ object Swapper {
     val logLines = mutableStateListOf<String>()
 
     val steps = listOf(
-        Step("Check root"),                         // 0
-        Step("Check this phone"),                   // 1
-        Step("Check the ROM zip"),                  // 2
-        Step("Check firmware on both slots"),       // 3
-        Step("Make room in super"),                 // 4
-        Step("Mark the other slot as not ready"),   // 5
-        Step("Write the boot images"),              // 6
-        Step("Write the system partitions"),        // 7
-        Step("Save the new partition table"),       // 8
-        Step("Switch to the new slot"),             // 9
-        Step("Schedule format data"),               // 10
-        Step("Reboot"),                             // 11
+        Step("Check root"),                                 // 0
+        Step("Check this phone"),                           // 1
+        Step("Check the ROM zip"),                          // 2
+        Step("Stage the ROM + trust its signing key"),      // 3
+        Step("Install with Android's updater"),             // 4
+        Step("Root the new ROM"),                           // 5
+        Step("Schedule format data"),                       // 6
+        Step("Reboot"),                                     // 7
     )
 
     fun init(c: Context) {
@@ -245,124 +241,94 @@ object Swapper {
                 val current = info["slot"].orEmpty()
                 val target = info["target"].orEmpty()
                 if (current !in listOf("_a", "_b") || target != Safety.otherSuffix(current)) throw IOException("Couldn't tell which slot the phone is on.")
-                val snap = info["snapshot"].orEmpty()
-                if (snap != "none" && snap != "cancelled") {
-                    throw SecurityException("An Android update is still pending on this phone (state: $snap). Reboot, let it finish, then try again.")
+                if (info["ue"] != "yes") throw SecurityException("This ROM has no update_engine, which bitSwap needs to install. Use bitFlash instead.")
+                val ueSt = info["ue_status"].orEmpty()
+                if (ueSt != "IDLE" && ueSt != "UPDATED_NEED_REBOOT" && ueSt != "UNKNOWN") {
+                    throw SecurityException("Android's updater is busy (state: $ueSt). Reboot and try again.")
                 }
-                info["busy"]?.takeIf { it.isNotBlank() }?.let {
-                    throw SecurityException("The other slot is in use right now ($it). Reboot and try again.")
-                }
-                if (info["slotctl"] == "none") throw SecurityException("This ROM has no way to switch slots from Android (no bootctl or boot HAL). Nothing was changed.")
-                if (info["super"] != "yes") throw IOException("This phone has no super partition.")
+                val freeMb = info["data_free_mb"]?.toLongOrNull() ?: -1
+                if (freeMb in 0 until 6000) log("⚠ Only ${freeMb} MB free on /data. Staging the ROM needs a few GB; it may run out.")
                 step(1, StepState.DONE, "${Safety.DEVICES[dev]!!.name}, running slot $current → installing to slot $target")
 
+                lateinit var sum: RomSummary
                 openZip(f) { ch, size ->
                     // 2. zip
                     cur = 2; step(2, StepState.RUNNING, "Checking ${f.name}…")
                     val s = analyse(ch, size)
-                    for (p in s.plain) {
-                        val dsz = client.cmd("PLAINSIZE ${p.name}").toLong()
-                        if (dsz < p.size) throw IOException("${p.name} from this ROM (${p.size} bytes) is bigger than the phone's ${p.name}$target ($dsz).")
+                    sum = s
+                    val props = Safety.readTextEntry(ch, size, "payload_properties.txt")
+                        ?: throw IOException("This ROM zip has no payload_properties.txt, so Android's updater can't install it. Is it a full A/B ROM zip?")
+                    val payload = Safety.findZipEntry(ch, size, "payload.bin")!!
+                    val cert = extractSigningKey(ch, size)
+                    step(2, StepState.DONE, "For ${s.info.device}, SDK ${s.info.sdk}, ${Planner.gb(s.totalBytes)}" +
+                        (if (cert == null) " — no signing cert found (updater may reject it)" else " ✓"))
+
+                    // 3. stage payload + trust the ROM's signing key
+                    cur = 3; step(3, StepState.RUNNING, "Copying payload.bin out of the zip…")
+                    val staged = File(ctx.cacheDir, "payload.bin")
+                    client.onProgress = {}
+                    copyRange(ch, payload.dataPos, payload.size, staged) { fr -> setProgress(0.0f + 0.9f * fr, "staging payload ${(fr * 100).toInt()}%") }
+                    main.post { steps[3].detail = "Handing it to the system updater…" }
+                    val stagedSize = client.stage(staged.absolutePath)
+                    runCatching { staged.delete() }
+                    if (cert != null) {
+                        val res = client.installKey(cert)
+                        log("Trusting the ROM's signing key so update_engine accepts it: $res")
                     }
-                    step(2, StepState.DONE, "For ${s.info.device}, SDK ${s.info.sdk}" +
-                        (if (s.skipped.isNotEmpty()) ". Skipping ${s.skipped.joinToString(", ")} (never touched)." else ". ✓"))
+                    step(3, StepState.DONE, "Staged ${Planner.gb(stagedSize)}" + (if (cert != null) ", ROM's key trusted ✓" else " ✓"))
 
-                    // 3. firmware
-                    cur = 3; step(3, StepState.RUNNING, "Comparing bootloader, modem and firmware on both slots (read only)…")
-                    client.onProgress = { p -> setProgress(p * 0.02f, "Comparing firmware") }
-                    val fw = client.cmd("FWCHECK " + s.plain.joinToString(" ") { it.name })
-                    val checked = fw.substringAfter("checked=").substringBefore(" ").split(',').filter { it.isNotBlank() }
-                    val diff = fw.substringAfter("diff=").split(',').filter { it.isNotBlank() }
-                    if (diff.isNotEmpty() && ignoreFirmware) {
-                        log("⚠ Firmware differs between slots (${diff.joinToString(", ")}). Continuing because \"Ignore firmware differences\" is on.")
-                        step(3, StepState.DONE, "⚠ Different on the other slot: ${diff.joinToString(", ")}. Ignored (your setting).")
-                    } else if (diff.isNotEmpty()) {
-                        throw SecurityException("The other slot has different firmware than the slot you're running (${diff.joinToString(", ")}). " +
-                            "Booting it could run older firmware, the anti-rollback brick. bitSwap never writes firmware, so it stopped. Nothing was changed.")
-                    }
-                    else step(3, StepState.DONE, "Both slots have the same firmware (${checked.size} partitions) ✓")
+                    // 4. install via update_engine
+                    cur = 4; step(4, StepState.RUNNING, "Android's updater is installing the new ROM to slot $target…")
+                    client.onProgress = { p -> setProgress(p, "installing ${(p * 100).toInt()}%") }
+                    client.ota(stagedSize, props)
+                    switched = true // update_engine marks the new slot active on success
+                    runCatching { client.cmd("CLEANUP") }
+                    step(4, StepState.DONE, "Installed to slot $target, and the updater set it active ✓")
 
-                    // 4. super
-                    cur = 4; step(4, StepState.RUNNING, "Reading super's partition table…")
-                    val dump = client.superDump()
-                    val geo = Lp.parseGeometry(dump[0])
-                    val slots = dump.drop(1).map { Lp.parseMetadata(it) }
-                    val curMeta = slots[Safety.slotIndex(current)]
-                    val plan = Planner.plan(geo, curMeta, target, s.dynamic.associate { it.name to it.size }, s.manifest.groups)
-                    client.cmd("PLAN ${plan.blob.size}", plan.blob)
-                    step(4, StepState.DONE, "${plan.newParts.size} partitions, ${Planner.gb(plan.needed)} of ${Planner.gb(plan.freeBefore)} free ✓ (not saved yet)")
-
-                    // 5. unbootable
-                    cur = 5; step(5, StepState.RUNNING, "So a half-written slot can never boot…")
-                    client.cmd("UNBOOTABLE")
-                    step(5, StepState.DONE, "Slot $target marked not ready. Your running slot is untouched.")
-
-                    // 6 + 7. write
+                    // 5. root the new ROM (patch its init_boot on the target slot)
+                    cur = 5
                     val patchName = patchTarget(s.plain)
-                    val doRoot = rootNewRom && Magisk.available(ctx)
-                    if (rootNewRom && !doRoot) log("⚠ This bitSwap build has no Magisk bundled, so the new ROM will be installed unrooted.")
-                    if (doRoot) log("Will root the new ROM: $patchName gets patched with Magisk ${Magisk.version(ctx)} before it's written.")
-                    val total = s.totalBytes.toDouble().coerceAtLeast(1.0)
-                    var doneBytes = 0L
-                    fun writeAll(stepIdx: Int, parts: List<Payload.Part>) {
-                        cur = stepIdx; step(stepIdx, StepState.RUNNING, "")
-                        for ((i, p) in parts.withIndex()) {
-                            val base = 0.03 + 0.95 * doneBytes / total
-                            val span = 0.95 * p.size / total
-                            main.post { steps[stepIdx].detail = "${p.name} (${i + 1}/${parts.size})…" }
-                            if (doRoot && p.name == patchName) {
-                                writeRooted(client, ch, s.manifest, p) { frac, what ->
-                                    setProgress((base + span * frac).toFloat(), "${p.name}: $what")
-                                }
-                            } else {
-                                writePart(client, ch, s.manifest, p) { frac, what ->
-                                    setProgress((base + span * frac).toFloat(), "${p.name}: $what")
-                                }
+                    if (rootNewRom && Magisk.available(ctx) && s.plain.any { it.name == patchName }) {
+                        step(5, StepState.RUNNING, "Patching $patchName with Magisk so the new ROM boots rooted…")
+                        // the install already succeeded, so don't fail the whole switch if rooting trips
+                        try {
+                            writeRooted(client, ch, s.manifest, s.plain.first { it.name == patchName }) { frac, what ->
+                                setProgress(frac.toFloat(), "$patchName: $what")
                             }
-                            doneBytes += p.size
+                            step(5, StepState.DONE, "$patchName patched ✓ (new ROM will be rooted)")
+                        } catch (e: Exception) {
+                            log("⚠ Couldn't root the new ROM (${e.message}). Installing it unrooted; you can root it later with bitFlash.")
+                            step(5, StepState.SKIPPED, "Rooting skipped (${e.message}). The ROM is installed; it'll be unrooted.")
                         }
-                        val extra = if (stepIdx == 6 && doRoot) " ($patchName rooted)" else ""
-                        step(stepIdx, StepState.DONE, parts.joinToString(" ") { it.name } + " ✓ (all verified)$extra")
+                    } else {
+                        val why = if (!rootNewRom) "you turned it off" else if (!Magisk.available(ctx)) "no Magisk in this build" else "no $patchName"
+                        step(5, StepState.SKIPPED, "Skipped ($why). The new ROM will be unrooted.")
                     }
-                    writeAll(6, s.plain)
-                    writeAll(7, s.dynamic)
-
-                    // 8. commit
-                    cur = 8; step(8, StepState.RUNNING, "Writing slot $target's partition table…")
-                    client.cmd("SYNC")
-                    client.cmd("COMMIT")
-                    step(8, StepState.DONE, "Saved and read back ✓")
                 }
 
-                // 9. switch
-                cur = 9; step(9, StepState.RUNNING, "Setting slot $target active…")
-                client.cmd("SWITCH")
-                switched = true
-                step(9, StepState.DONE, "Next boot uses slot $target ✓")
-
-                // 10. wipe
-                cur = 10; step(10, StepState.RUNNING, "Telling recovery to format data on next boot…")
+                // 6. wipe
+                cur = 6; step(6, StepState.RUNNING, "Telling recovery to format data on next boot…")
                 try {
                     client.cmd("WIPE")
+                    step(6, StepState.DONE, "Recovery will format data, then start the new ROM ✓")
                 } catch (e: Exception) {
-                    log("✕ Couldn't schedule the wipe (${e.message}). Switching back to slot $current…")
-                    client.cmd("REVERT")
-                    switched = false
-                    throw IOException("Couldn't schedule format data, so bitSwap switched back to slot $current. Nothing on your running ROM changed.")
+                    // install already done + slot active; without the wipe it'll boot the new ROM with old data
+                    log("⚠ Couldn't schedule the format (${e.message}). The new ROM is installed and active; it'll boot with your old data (may need a manual wipe in recovery).")
+                    step(6, StepState.SKIPPED, "Format not scheduled (${e.message}); new ROM still installed.")
                 }
-                step(10, StepState.DONE, "Recovery will format data, then start the new ROM ✓")
 
-                // 11. reboot
-                cur = 11; step(11, StepState.RUNNING, "Rebooting…")
+                // 7. reboot
+                cur = 7; step(7, StepState.RUNNING, "Rebooting…")
                 setProgress(1f, "Rebooting")
                 main.post { finished = true }
                 Thread.sleep(1500)
                 client.cmd("REBOOT")
-                step(11, StepState.DONE, "Rebooting into recovery: it formats data, then the new ROM's setup starts. If the phone doesn't restart, restart it yourself.")
+                step(7, StepState.DONE, "Rebooting into recovery: it formats data, then the new ROM starts. First boot takes a while (it finishes the install). If it doesn't restart, restart it yourself.")
             } catch (e: Exception) {
                 val why = e.message ?: e.javaClass.simpleName
                 step(cur, StepState.FAILED, why)
-                val safe = if (switched) "" else "\n\nYour phone is still on the ROM you're running now (slot ${slot.ifBlank { "?" }}) and will boot it normally."
+                val safe = if (switched) "\n\nThe new ROM was already installed before this, so it may boot on the next restart."
+                           else "\n\nNothing was installed. Your phone is still on the ROM you're running now (slot ${slot.ifBlank { "?" }}) and will boot it normally."
                 main.post { error = why + safe }
             } finally {
                 runCatching { rc?.close() }
@@ -443,6 +409,40 @@ object Swapper {
                 prog((i + 1.0) / p.ops.size)
             }
         }
+    }
+
+    /** Copies [len] bytes at [pos] in the zip (payload.bin is stored, so this is a raw copy) to [out]. */
+    private fun copyRange(ch: FileChannel, pos: Long, len: Long, out: File, prog: (Float) -> Unit) {
+        java.io.RandomAccessFile(out, "rw").use { raf ->
+            raf.setLength(0)
+            val buf = java.nio.ByteBuffer.allocate(8 shl 20)
+            var p = pos; var done = 0L
+            while (done < len) {
+                buf.clear(); buf.limit(minOf(buf.capacity().toLong(), len - done).toInt())
+                var r = 0
+                while (buf.hasRemaining()) { val n = ch.read(buf, p + r); if (n < 0) throw IOException("ROM zip ended early"); r += n }
+                buf.flip(); raf.channel.write(buf)
+                done += r; p += r; prog(done.toFloat() / len)
+            }
+        }
+    }
+
+    /**
+     * Pulls the ROM's signing certificate out of the zip and returns its public key as a PEM, so the
+     * root side can make update_engine verify this ROM's payload with its own key (a different ROM is
+     * signed with a different key, which is exactly why Android's updater would otherwise reject it).
+     */
+    private fun extractSigningKey(ch: FileChannel, size: Long): ByteArray? {
+        val certDer = (Safety.readEntryBytes(ch, size, "META-INF/com/android/otacert")
+            ?: Safety.readEntryBytes(ch, size, "META-INF/CERT.RSA")) ?: return null
+        return runCatching {
+            val cf = java.security.cert.CertificateFactory.getInstance("X.509")
+            // otacert is a bare X.509; CERT.RSA is PKCS#7 — generateCertificates handles both
+            val cert = cf.generateCertificates(java.io.ByteArrayInputStream(certDer)).firstOrNull()
+                ?: return@runCatching null
+            val b64 = java.util.Base64.getMimeEncoder(64, "\n".toByteArray()).encodeToString(cert.publicKey.encoded)
+            ("-----BEGIN PUBLIC KEY-----\n$b64\n-----END PUBLIC KEY-----\n").toByteArray()
+        }.getOrNull()
     }
 
     private fun sha256File(f: File): ByteArray {

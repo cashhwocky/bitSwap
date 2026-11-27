@@ -89,6 +89,15 @@ class RootClient private constructor(private val proc: Process) : Closeable {
         cmd("WRITE $name $offset $len", data, off, len)
     }
 
+    fun stage(appPath: String): Long = cmd("STAGE $appPath").trim().toLong()
+
+    fun ota(size: Long, headers: String) {
+        cmd("OTA $size " + Base64.getEncoder().encodeToString(headers.toByteArray(Charsets.UTF_8)))
+    }
+
+    /** Makes update_engine trust the ROM's own signing key. Returns a short status like "2/2". */
+    fun installKey(pem: ByteArray): String = cmd("PAYLOADKEY ${pem.size}", pem)
+
     override fun close() {
         runCatching { cmd("QUIT") }
         runCatching { proc.waitFor(5, TimeUnit.SECONDS) }

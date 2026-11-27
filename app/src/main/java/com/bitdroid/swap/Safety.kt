@@ -205,6 +205,13 @@ object Safety {
         }
     }
 
+    /** Reads a (small) text entry like payload_properties.txt out of a zip, or null if it's not there. */
+    fun readTextEntry(ch: FileChannel, size: Long, name: String): String? =
+        readZipEntry(ch, size, name)?.let { String(it, Charsets.UTF_8) }
+
+    /** Reads a (small) binary entry like META-INF/CERT.RSA out of a zip, or null if it's not there. */
+    fun readEntryBytes(ch: FileChannel, size: Long, name: String): ByteArray? = readZipEntry(ch, size, name)
+
     /** Reads `len` bytes at `pos`. */
     fun readBytes(ch: FileChannel, pos: Long, len: Int): ByteArray {
         val b = ByteArray(len)

@@ -1,7 +1,7 @@
 # bitSwap
 
 Switch a Pixel to a different ROM **from the phone itself**. No PC, no second phone.
-Pick a ROM zip, tap **Switch**: bitSwap installs it on the other slot, formats data and reboots into it.
+Pick a ROM zip, tap **Switch**: bitSwap installs it, formats data and reboots into it.
 
 Made by Alex Desrosier for bitDroid.
 
@@ -9,29 +9,41 @@ Made by Alex Desrosier for bitDroid.
 Pixel 10 (`frankel`), Pixel 10 Pro (`blazer`), Pixel 10 Pro XL (`mustang`), Pixel 6a (`bluejay`).
 
 ## Needs root (Magisk)
-Android only lets rooted apps write partitions. No root? Use **bitFlash** → *Root this Pixel* (one tap, nothing wiped).
+Android only lets rooted apps do this. No root? Use **bitFlash** → *Root this Pixel* (one tap, nothing wiped).
 
-## What it does
-1. **Check root**: starts a small root helper inside bitSwap's own APK through `su` (no extra binaries).
-2. **Check this phone**: supported device, which slot it runs on, no Android update pending, other slot not in use.
-3. **Check the ROM zip**: `pre-device` must match, `post-sdk-level` ≥ 37 (Android 17), full A/B ROM only (no incremental or partial OTAs, only REPLACE / REPLACE_XZ / REPLACE_BZ / ZSTD / ZERO / DISCARD).
-4. **Check firmware on both slots** (read only): bootloader, modem and other firmware partitions the ROM doesn't rewrite must be identical on both slots, otherwise it stops (booting the other slot could run older firmware: the anti-rollback brick).
-5. **Make room in super**: builds the other slot's partition table the way update_engine does, using only free space next to the running ROM. Not saved yet.
-6. **Mark the other slot as not ready** so a half-written slot can never boot.
-7. **Write** boot images (`/dev/block/by-name/<part>_<other>`) and system partitions (into super), build the dm-verity hash tree and FEC on the phone when the ROM leaves them out, then **check every partition's SHA-256** against the ROM.
-8. **Save the new partition table** (other slot's metadata only; the running slot's is never written).
-9. **Switch** the active slot (`bootctl`, or the boot HAL through `service call`).
-10. **Schedule format data** (`--wipe_data` in misc's bootloader message, first 2 KB only). If this fails it switches back.
-11. **Reboot** to recovery: it formats data and starts the new ROM's setup.
+## How it installs (experimental)
+A Pixel's `super` partition only holds one full ROM, so bitSwap can't just write a second copy. Instead it
+drives Android's **own** installer, `update_engine` — the same thing OTAs use — which installs the other slot
+as a compressed snapshot, builds verity, and switches slots.
 
-## Never, hard-coded (the root helper enforces these, not just the UI)
-- Never touches the bootloader, modem/radio, firmware, or bootloader lock state. Never locks the bootloader. (`pvmfw`, the protected-VM firmware, is written from the ROM to the other slot, same as a recovery install. `dram_train` is RAM calibration the bootloader writes per slot, so it isn't compared.)
-- Never writes the slot the phone is running on, or space in super used by the running ROM.
-- Never flashes a ROM for another device or older than Android 17.
-- If anything fails before the slot switch, the phone still boots the ROM it's on.
+The catch with a *different* ROM is that `update_engine` verifies the payload against the running ROM's
+signing key. So bitSwap pulls the new ROM's own signing certificate out of the zip and bind-mounts its public
+key over the verify path (in init's mount namespace, so the daemon sees it). Then `update_engine` accepts the
+new ROM's payload. The mount is undone by the reboot.
+
+Steps:
+1. **Check root** — small root helper inside bitSwap's own APK via `su`.
+2. **Check this phone** — supported device, which slot, `update_engine` present and idle, free space.
+3. **Check the ROM zip** — `pre-device` matches, `post-sdk-level` ≥ 37 (Android 17), full A/B ROM, has `payload.bin`, `payload_properties.txt`, signing cert.
+4. **Stage the ROM + trust its signing key** — copy `payload.bin` to `/data/ota_package`, overlay the ROM's public key.
+5. **Install with Android's updater** — `update_engine` writes the other slot and marks it active.
+6. **Root the new ROM** (optional) — patch the new slot's `init_boot` with Magisk so it boots rooted.
+7. **Schedule format data** — `--wipe_data` in misc's bootloader message (first 2 KB only).
+8. **Reboot** — recovery formats data, first boot finishes the install, new ROM starts.
+
+## Safety (enforced in the root helper, not just the UI)
+- Only `update_engine` writes partitions; a full OTA has no bootloader/modem/firmware, so those are never touched.
+- The one partition bitSwap writes by hand is `init_boot` on the **inactive** slot (for Magisk); the running slot is refused.
+- `misc` only ever gets the standard recovery wipe message. The bootloader is never locked.
+- Nothing is installed until step 5 succeeds. If it fails, your phone still boots the ROM you're on.
+
+## Known limits (untested on a device)
+- If the ROM signs its payload with a different key than its zip certificate, `update_engine` still rejects it → use bitFlash.
+- `update_engine` enforces anti-rollback by build timestamp; a ROM older than what's installed may be refused.
+- If staging runs `/data` low on space, it stops before installing.
 
 ## Build
 GitHub Actions builds a release APK on every push to `main` and publishes `bitSwap-v0.1.N.apk`.
-Optional signing secrets: `BITSWAP_KEYSTORE_BASE64`, `BITSWAP_KEYSTORE_PASSWORD`, `BITSWAP_KEY_ALIAS`, `BITSWAP_KEY_PASSWORD`.
+It bundles Magisk (for rooting the new ROM). Optional signing secrets: `BITSWAP_KEYSTORE_BASE64`, `BITSWAP_KEYSTORE_PASSWORD`, `BITSWAP_KEY_ALIAS`, `BITSWAP_KEY_PASSWORD`.
 
 Payload and zip reading started from bitFlash.

@@ -99,7 +99,6 @@ fun App() {
             item { RomCard(onPick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) }) }
             item { RootNewRomCard() }
             item { StepsCard() }
-            item { AdvancedCard() }
             item {
                 val ready = s.root == RootClient.Root.OK && s.summary != null && s.profile != null && !s.busy && !s.finished
                 Button(
@@ -285,7 +284,7 @@ private fun StepsCard() {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Everything before \"Save the new partition table\" only touches the other slot. If anything fails, bitSwap stops and your phone boots the ROM you're on now.",
+                "Nothing is installed until \"Install with Android's updater\" succeeds. If anything fails before that, your phone still boots the ROM you're on now.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
